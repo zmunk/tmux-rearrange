@@ -255,25 +255,6 @@ impl TmuxRearrangeApp {
                 None => return, // can't remove the only pane
             };
 
-            // Safety check: preview tree must NOT contain the dragged pane
-            let preview_leaves = leaf_order(&preview_tree);
-            if preview_leaves.contains(&pane_id) {
-                eprintln!(
-                    "BUG: preview tree still contains dragged pane '{}' after remove!\n\
-                     original leaves: {:?}\n\
-                     preview leaves:  {:?}\n\
-                     original tree: {:?}\n\
-                     preview tree:  {:?}",
-                    pane_id,
-                    leaf_order(&original_tree),
-                    preview_leaves,
-                    original_tree,
-                    preview_tree
-                );
-                // Don't proceed — the remove is broken, dragging would duplicate.
-                return;
-            }
-
             // Find original rect of the dragged pane in the original tree
             let (orig_rects, _) = compute_layout_rects(&original_tree, self.canvas_rect);
             let original_rect = orig_rects
@@ -349,22 +330,11 @@ impl TmuxRearrangeApp {
                 // Count occurrences of the dragged pane — must be exactly 1.
                 let leaves = leaf_order(&new_tree);
                 let count = leaves.iter().filter(|id| *id == &drag.pane_id).count();
-                if count == 0 {
-                    eprintln!(
-                        "BUG: dragged pane '{}' missing from result tree. zone={:?}",
-                        drag.pane_id, zone
-                    );
-                } else if count > 1 {
-                    eprintln!(
-                        "BUG: dragged pane '{}' appears {} times in result tree (duplicate!). zone={:?}\n\
-                         result leaves: {:?}",
-                        drag.pane_id, count, zone, leaves
-                    );
-                    // Fall back to original tree to avoid duplication
-                } else {
+                if count == 1 {
                     self.tree = new_tree;
                     applied = true;
                 }
+                // If count != 1 (missing or duplicate), fall back to original tree.
             }
 
             if !applied {
@@ -549,27 +519,6 @@ impl TmuxRearrangeApp {
     fn render(&mut self, painter: &egui::Painter, cursor_pos: Option<Pos2>) {
         let canvas_rect = self.canvas_rect;
 
-        // Debug: print what we're about to render
-        let drag_active = self.drag.is_some();
-        let pane_ids: Vec<&str> = self
-            .pane_rects
-            .iter()
-            .map(|lr| lr.pane_id.as_str())
-            .collect();
-        eprintln!(
-            "RENDER: drag={} panes={:?} tree_leaves={:?}",
-            drag_active,
-            pane_ids,
-            leaf_order(if drag_active {
-                self.drag
-                    .as_ref()
-                    .map(|d| &d.preview_tree)
-                    .unwrap_or(&self.tree)
-            } else {
-                &self.tree
-            })
-        );
-
         // Draw canvas background
         painter.rect_filled(canvas_rect, 2.0, Color32::from_rgb(30, 30, 30));
 
@@ -639,10 +588,7 @@ impl TmuxRearrangeApp {
 
                 if snap_rect.width() > 0.0 && snap_rect.height() > 0.0 {
                     cache.update(grid, snap_rect.width(), snap_rect.height(), bg);
-                    let snap_font = egui::FontId::monospace(
-                        (snap_rect.height() / grid.rows() as f32 * 0.75).max(4.0),
-                    );
-                    cache.paint(painter, snap_rect.left_top(), snap_rect, snap_font);
+                    cache.paint(painter, snap_rect.left_top(), snap_rect);
                 }
             }
         }

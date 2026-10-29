@@ -168,8 +168,10 @@ pub struct SnapshotCache {
 struct CachedCell {
     rect: egui::Rect,
     bg: egui::Color32,
+    /// If present, a foreground block should be drawn at this relative rect
+    /// (inset from `rect`, only for non-space characters).
+    fg_rect: Option<egui::Rect>,
     fg: egui::Color32,
-    text: String,
 }
 
 impl SnapshotCache {
@@ -204,19 +206,18 @@ impl SnapshotCache {
         let cell_w = pixel_w / cols as f32;
         let cell_h = pixel_h / rows as f32;
 
+        // Inset for the foreground block inside each cell.
+        let inset = cell_w.min(cell_h) * 0.15;
+
         let mut cells = Vec::new();
 
         for row in 0..rows {
             for col in 0..cols {
-                let bg = if let Some(cell) = grid.cell(row, col) {
-                    cell.bg
+                let (bg, fg, has_char) = if let Some(cell) = grid.cell(row, col) {
+                    let ch = cell.ch;
+                    (cell.bg, cell.fg, ch != ' ' && ch != '\0')
                 } else {
-                    default_bg
-                };
-                let (fg, text) = if let Some(cell) = grid.cell(row, col) {
-                    (cell.fg, cell.ch.to_string())
-                } else {
-                    (DEFAULT_FG, String::new())
+                    (default_bg, DEFAULT_FG, false)
                 };
 
                 let x = col as f32 * cell_w;
@@ -224,7 +225,21 @@ impl SnapshotCache {
                 let rect =
                     egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x + cell_w, y + cell_h));
 
-                cells.push(CachedCell { rect, bg, fg, text });
+                let fg_rect = if has_char {
+                    Some(egui::Rect::from_min_max(
+                        egui::pos2(x + inset, y + inset),
+                        egui::pos2(x + cell_w - inset, y + cell_h - inset),
+                    ))
+                } else {
+                    None
+                };
+
+                cells.push(CachedCell {
+                    rect,
+                    bg,
+                    fg_rect,
+                    fg,
+                });
             }
         }
 
@@ -233,13 +248,7 @@ impl SnapshotCache {
     }
 
     /// Render the snapshot into the given painter at `offset` position, clipped to `clip_rect`.
-    pub fn paint(
-        &self,
-        painter: &egui::Painter,
-        offset: egui::Pos2,
-        clip_rect: egui::Rect,
-        font_id: egui::FontId,
-    ) {
+    pub fn paint(&self, painter: &egui::Painter, offset: egui::Pos2, clip_rect: egui::Rect) {
         for cell in &self.cells {
             let rect = cell.rect.translate(offset.to_vec2());
 
@@ -251,16 +260,10 @@ impl SnapshotCache {
             // Background
             painter.rect_filled(rect, 0.0, cell.bg);
 
-            // Text
-            if !cell.text.is_empty() && cell.text != " " {
-                let center = rect.center();
-                painter.text(
-                    center,
-                    egui::Align2::CENTER_CENTER,
-                    &cell.text,
-                    font_id.clone(),
-                    cell.fg,
-                );
+            // Foreground block (solid color, no text)
+            if let Some(fg_rect) = cell.fg_rect {
+                let fg_rect = fg_rect.translate(offset.to_vec2());
+                painter.rect_filled(fg_rect, 0.0, cell.fg);
             }
         }
     }

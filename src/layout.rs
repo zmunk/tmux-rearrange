@@ -545,16 +545,7 @@ pub fn extract_total_dimensions(layout_str: &str) -> Result<(u16, u16), ParseErr
 pub fn remove(tree: &Node, pane_id: &str) -> Option<Node> {
     match tree {
         Node::Leaf { pane_id: id } => {
-            let matches = id == pane_id;
-            eprintln!(
-                "remove LEAF: id='{}' (len={}) pane_id='{}' (len={}) match={}",
-                id,
-                id.len(),
-                pane_id,
-                pane_id.len(),
-                matches
-            );
-            if matches {
+            if id == pane_id {
                 None
             } else {
                 Some(tree.clone())
@@ -564,11 +555,6 @@ pub fn remove(tree: &Node, pane_id: &str) -> Option<Node> {
             orientation,
             children,
         } => {
-            eprintln!(
-                "remove SPLIT: searching for '{}' in {} children",
-                pane_id,
-                children.len()
-            );
             let mut new_children: Vec<(Node, f32)> = Vec::new();
             let mut found = false;
             let mut _removed_prop = 0.0f32;
@@ -592,7 +578,6 @@ pub fn remove(tree: &Node, pane_id: &str) -> Option<Node> {
                 }
             }
 
-            eprintln!("remove SPLIT: found={}", found);
             if !found {
                 return Some(tree.clone());
             }
