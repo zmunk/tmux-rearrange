@@ -895,7 +895,67 @@ pub fn compute_layout_rects(
     (pane_rects, dividers)
 }
 
-const BORDER_PX: f32 = 2.0; // visual border width between panes in pixels
+/// Compute the natural pixel size of a layout tree using each leaf's actual
+/// terminal cell dimensions.  Returns (width, height) in pixels.
+pub fn compute_natural_size(
+    node: &Node,
+    pane_dims: &std::collections::HashMap<PaneId, (u16, u16)>,
+    cell_scale_x: f32,
+    cell_scale_y: f32,
+) -> (f32, f32) {
+    match node {
+        Node::Leaf { pane_id } => {
+            let (cols, rows) = pane_dims.get(pane_id).copied().unwrap_or((80, 24));
+            (cols as f32 * cell_scale_x, rows as f32 * cell_scale_y)
+        }
+        Node::Split {
+            orientation,
+            children,
+        } => {
+            let n = children.len();
+            if n == 0 {
+                return (0.0, 0.0);
+            }
+            let child_sizes: Vec<(f32, f32)> = children
+                .iter()
+                .map(|(child, _)| {
+                    compute_natural_size(child, pane_dims, cell_scale_x, cell_scale_y)
+                })
+                .collect();
+            let border_px = (n.saturating_sub(1)) as f32 * BORDER_PX;
+            match orientation {
+                Orientation::Horizontal => {
+                    let total_w = child_sizes.iter().map(|(w, _)| *w).sum::<f32>() + border_px;
+                    let max_h = child_sizes.iter().map(|(_, h)| *h).fold(0.0f32, f32::max);
+                    (total_w, max_h)
+                }
+                Orientation::Vertical => {
+                    let max_w = child_sizes.iter().map(|(w, _)| *w).fold(0.0f32, f32::max);
+                    let total_h = child_sizes.iter().map(|(_, h)| *h).sum::<f32>() + border_px;
+                    (max_w, total_h)
+                }
+            }
+        }
+    }
+}
+
+/// Like [`compute_layout_rects`] but sizes the total bounding box according
+/// to each leaf's actual terminal cell dimensions rather than fitting a
+/// fixed-size rect.  Returns pane rects, dividers, and the total size.
+pub fn compute_natural_layout_rects(
+    node: &Node,
+    pane_dims: &std::collections::HashMap<PaneId, (u16, u16)>,
+    cell_scale_x: f32,
+    cell_scale_y: f32,
+    origin: egui::Pos2,
+) -> (Vec<LayoutRect>, Vec<Divider>, f32, f32) {
+    let (total_w, total_h) = compute_natural_size(node, pane_dims, cell_scale_x, cell_scale_y);
+    let total_rect = egui::Rect::from_min_size(origin, egui::Vec2::new(total_w, total_h));
+    let (pane_rects, dividers) = compute_layout_rects(node, total_rect);
+    (pane_rects, dividers, total_w, total_h)
+}
+
+pub const BORDER_PX: f32 = 2.0; // visual border width between panes in pixels
 
 fn compute_rects_impl(
     node: &Node,

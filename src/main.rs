@@ -100,7 +100,22 @@ fn run(window: &str) -> Result<i32, Box<dyn std::error::Error>> {
     // 8. Get pane-border-status
     let pane_border_status = tmux::get_pane_border_status(window).unwrap_or_default();
 
-    // 9. Launch GUI
+    // 9. Compute natural pixel size of the layout from pane cell dimensions.
+    let pane_dims: std::collections::HashMap<String, (u16, u16)> = pane_info
+        .iter()
+        .map(|p| (p.pane_id.clone(), (p.width, p.height)))
+        .collect();
+    // Cell scale: 6 px wide × 12 px tall per cell (≈ 0.5 aspect, matches
+    // terminal character proportions used by the minimap texture).
+    let cell_scale_x: f32 = 2.0;
+    let cell_scale_y: f32 = 4.0;
+    let (natural_w, natural_h) =
+        layout::compute_natural_size(&tree, &pane_dims, cell_scale_x, cell_scale_y);
+    let natural_size = egui::Vec2::new(natural_w, natural_h);
+    // Add estimated height for bottom button bar + window chrome.
+    let chrome_h = 48.0;
+
+    // 10. Launch GUI
     let app = app::TmuxRearrangeApp::new(
         window.to_string(),
         tree,
@@ -110,11 +125,12 @@ fn run(window: &str) -> Result<i32, Box<dyn std::error::Error>> {
         snapshots,
         active_pane_id,
         pane_border_status,
+        natural_size,
     );
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
+            .with_inner_size([natural_w, natural_h + chrome_h])
             .with_title("tmux-rearrange"),
         ..Default::default()
     };

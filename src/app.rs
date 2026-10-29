@@ -1,10 +1,19 @@
 //! eframe App: drag-and-drop pane rearrangement UI.
 
-use crate::layout::{self, compute_layout_rects, leaf_order, LayoutRect, Node, Side};
+use crate::layout::{
+    self, compute_layout_rects, compute_natural_layout_rects, leaf_order, LayoutRect, Node, Side,
+};
 use crate::snapshot::GrayscaleSnapshot;
 use crate::tmux;
 use egui::{Color32, Pos2, Rect, Vec2};
 use std::collections::HashMap;
+
+/// Pixel size per terminal cell.  Ratio CELL_SCALE_X / CELL_SCALE_Y ≈ 0.5
+/// matches the 2:1 cell aspect used by the minimap texture rendering.
+const CELL_SCALE_X: f32 = 2.0;
+const CELL_SCALE_Y: f32 = 4.0;
+/// Estimated height of the bottom button bar + window chrome.
+const CHROME_H: f32 = 48.0;
 
 // ---------------------------------------------------------------------------
 // Drop zone types
@@ -59,9 +68,14 @@ pub struct TmuxRearrangeApp {
     dividers: Vec<layout::Divider>,
     /// The rect of the layout canvas (where panes are drawn).
     canvas_rect: Rect,
-    /// Scale factor: cells → pixels.
-    scale_x: f32,
-    scale_y: f32,
+    /// Natural pixel size of the entire layout (panes + dividers).
+    natural_size: Vec2,
+    /// Whether we've applied the initial viewport size.
+    viewport_sized: bool,
+    /// Current display scale (≤ 1.0) to fit the layout on screen.
+    display_scale: f32,
+    /// Pane cell dimensions: pane_id → (cols, rows).
+    pane_dims: HashMap<layout::PaneId, (u16, u16)>,
 }
 
 struct DragState {
@@ -87,10 +101,16 @@ impl TmuxRearrangeApp {
         snapshots: HashMap<layout::PaneId, GrayscaleSnapshot>,
         active_pane_id: Option<layout::PaneId>,
         pane_border_status: String,
+        natural_size: Vec2,
     ) -> Self {
         let pane_info_map: HashMap<_, _> = pane_info
             .into_iter()
             .map(|p| (p.pane_id.clone(), p))
+            .collect();
+
+        let pane_dims: HashMap<layout::PaneId, (u16, u16)> = pane_info_map
+            .iter()
+            .map(|(id, info)| (id.clone(), (info.width, info.height)))
             .collect();
 
         TmuxRearrangeApp {
@@ -108,8 +128,10 @@ impl TmuxRearrangeApp {
             pane_rects: Vec::new(),
             dividers: Vec::new(),
             canvas_rect: Rect::NOTHING,
-            scale_x: 1.0,
-            scale_y: 1.0,
+            natural_size,
+            viewport_sized: false,
+            display_scale: 1.0,
+            pane_dims,
         }
     }
 }
@@ -138,46 +160,55 @@ impl eframe::App for TmuxRearrangeApp {
             self.textures_loaded = true;
         }
 
+        // Set initial viewport size, capped to 90% of screen.
+        if !self.viewport_sized {
+            self.viewport_sized = true;
+            let screen = ctx.screen_rect();
+            let max_w = screen.width() * 0.9;
+            let max_h = screen.height() * 0.9;
+            let s = (max_w / self.natural_size.x)
+                .min(max_h / (self.natural_size.y + CHROME_H))
+                .min(1.0);
+            let desired = egui::Vec2::new(
+                self.natural_size.x * s,
+                (self.natural_size.y + CHROME_H) * s,
+            );
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+        }
+
         // Central canvas
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.canvas_rect = ui.available_rect_before_wrap();
-            let available = ui.available_size();
+            let available = ui.available_rect_before_wrap();
 
-            // Compute scale to fit the tmux window aspect ratio
-            let aspect = self.total_w as f32 / (self.total_h as f32).max(1.0);
-            let available_aspect = available.x / available.y.max(1.0);
+            // Scale the natural layout to fit available space (never upscale).
+            let scale = (available.width() / self.natural_size.x)
+                .min(available.height() / self.natural_size.y)
+                .min(1.0);
+            self.display_scale = scale;
 
-            let (canvas_w, canvas_h) = if available_aspect > aspect {
-                // Height-constrained
-                let h = available.y;
-                let w = h * aspect;
-                (w, h)
-            } else {
-                // Width-constrained
-                let w = available.x;
-                let h = w / aspect;
-                (w, h)
-            };
-
-            self.scale_x = canvas_w / self.total_w as f32;
-            self.scale_y = canvas_h / self.total_h as f32;
-
-            // Center the canvas
-            let canvas_left = self.canvas_rect.left() + (available.x - canvas_w) * 0.5;
-            let canvas_top = self.canvas_rect.top() + (available.y - canvas_h) * 0.5;
+            let canvas_w = self.natural_size.x * scale;
+            let canvas_h = self.natural_size.y * scale;
+            let canvas_left = available.left() + (available.width() - canvas_w).max(0.0) * 0.5;
+            let canvas_top = available.top() + (available.height() - canvas_h).max(0.0) * 0.5;
             let canvas_rect = Rect::from_min_size(
                 Pos2::new(canvas_left, canvas_top),
                 Vec2::new(canvas_w, canvas_h),
             );
             self.canvas_rect = canvas_rect;
 
-            // Compute layout rects first (needed for hit-testing in on_press)
+            // Compute layout rects at the scaled cell size.
             let display_tree = if let Some(ref drag) = self.drag {
                 &drag.preview_tree
             } else {
                 &self.tree
             };
-            let (pane_rects, dividers) = compute_layout_rects(display_tree, canvas_rect);
+            let (pane_rects, dividers, _total_w, _total_h) = compute_natural_layout_rects(
+                display_tree,
+                &self.pane_dims,
+                CELL_SCALE_X * scale,
+                CELL_SCALE_Y * scale,
+                canvas_rect.left_top(),
+            );
             self.pane_rects = pane_rects;
             self.dividers = dividers;
 
@@ -187,17 +218,35 @@ impl eframe::App for TmuxRearrangeApp {
             let released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
             let down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
 
+            // Helper to recompute natural layout rects after tree changes.
+            let recompute =
+                |tree: &Node,
+                 pane_rects: &mut Vec<LayoutRect>,
+                 dividers: &mut Vec<layout::Divider>,
+                 pane_dims: &HashMap<layout::PaneId, (u16, u16)>| {
+                    let (pr, div, _, _) = compute_natural_layout_rects(
+                        tree,
+                        pane_dims,
+                        CELL_SCALE_X * scale,
+                        CELL_SCALE_Y * scale,
+                        canvas_rect.left_top(),
+                    );
+                    *pane_rects = pr;
+                    *dividers = div;
+                };
+
             // Process press before release so a click in one frame
             // (both pressed + released) starts and finishes the drag correctly.
             if let Some(pos) = pointer_pos {
                 if pressed {
                     self.on_press(pos);
-                    // Recompute layout after starting drag so the preview tree
-                    // (without dragged pane) is shown immediately.
                     if let Some(ref drag) = self.drag {
-                        let (pr, div) = compute_layout_rects(&drag.preview_tree, canvas_rect);
-                        self.pane_rects = pr;
-                        self.dividers = div;
+                        recompute(
+                            &drag.preview_tree,
+                            &mut self.pane_rects,
+                            &mut self.dividers,
+                            &self.pane_dims.clone(),
+                        );
                     }
                 }
             }
@@ -208,19 +257,19 @@ impl eframe::App for TmuxRearrangeApp {
                 if let Some(release_pos) = pointer_pos {
                     self.on_release(release_pos);
                 } else {
-                    // Pointer outside window: cancel the drag.
                     self.cancel_drag();
                 }
-                // Recompute layout after drop so rendering shows the result
-                // immediately instead of one frame later.
                 let display_tree = if let Some(ref drag) = self.drag {
                     &drag.preview_tree
                 } else {
                     &self.tree
                 };
-                let (pr, div) = compute_layout_rects(display_tree, canvas_rect);
-                self.pane_rects = pr;
-                self.dividers = div;
+                recompute(
+                    display_tree,
+                    &mut self.pane_rects,
+                    &mut self.dividers,
+                    &self.pane_dims.clone(),
+                );
             }
 
             if let Some(pos) = pointer_pos {
@@ -296,14 +345,12 @@ impl TmuxRearrangeApp {
 
     fn on_drag(&mut self, pos: Pos2) {
         if let Some(ref mut drag) = self.drag {
-            // Hit test against the preview tree to find drop zone
-            let (preview_rects, preview_dividers) =
-                compute_layout_rects(&drag.preview_tree, self.canvas_rect);
+            // Use the already-computed natural layout rects from this frame.
             drag.drop_zone = hit_test(
                 pos,
                 self.canvas_rect,
-                &preview_rects,
-                &preview_dividers,
+                &self.pane_rects,
+                &self.dividers,
                 &drag.pane_id,
             );
         }
@@ -311,14 +358,12 @@ impl TmuxRearrangeApp {
 
     fn on_release(&mut self, pos: Pos2) {
         if let Some(drag) = self.drag.take() {
-            // Final hit test
-            let (preview_rects, preview_dividers) =
-                compute_layout_rects(&drag.preview_tree, self.canvas_rect);
+            // Final hit test using pre-computed natural layout rects.
             let drop_zone = hit_test(
                 pos,
                 self.canvas_rect,
-                &preview_rects,
-                &preview_dividers,
+                &self.pane_rects,
+                &self.dividers,
                 &drag.pane_id,
             );
 
@@ -609,42 +654,13 @@ impl TmuxRearrangeApp {
                 Color32::from_rgba_premultiplied(255, 255, 255, 180),
             );
 
-            // Draw grayscale minimap texture if available
+            // Draw grayscale minimap texture if available, filling the pane.
             if let Some(handle) = self.texture_handles.get(&lr.pane_id) {
-                if let Some(snap) = self.snapshots.get(&lr.pane_id) {
-                    let margin = 2.0;
-                    let label_h = 16.0;
-                    let avail = Rect::from_min_max(
-                        Pos2::new(lr.rect.left() + margin, lr.rect.top() + label_h),
-                        Pos2::new(lr.rect.right() - margin, lr.rect.bottom() - margin),
-                    );
-
-                    if avail.width() > 0.0 && avail.height() > 0.0 {
-                        // Terminal cells are ~2× taller than wide (cell aspect ≈ 0.5).
-                        // Letter-box the texture into `avail` preserving this aspect.
-                        let cell_aspect: f32 = 0.5;
-                        let tex_w = snap.cols as f32;
-                        let tex_h = snap.rows as f32;
-                        let tex_display_aspect = (tex_w * cell_aspect) / tex_h;
-                        let avail_aspect = avail.width() / avail.height();
-
-                        let draw_rect = if avail_aspect > tex_display_aspect {
-                            // Height-constrained: centre horizontally.
-                            let h = avail.height();
-                            let w = h * tex_display_aspect;
-                            Rect::from_center_size(avail.center(), Vec2::new(w, h))
-                        } else {
-                            // Width-constrained: centre vertically.
-                            let w = avail.width();
-                            let h = w / tex_display_aspect;
-                            Rect::from_center_size(avail.center(), Vec2::new(w, h))
-                        };
-
-                        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-                        let mut mesh = egui::epaint::Mesh::with_texture(handle.id());
-                        mesh.add_rect_with_uv(draw_rect, uv, Color32::WHITE);
-                        painter.add(egui::Shape::Mesh(mesh));
-                    }
+                if self.snapshots.contains_key(&lr.pane_id) {
+                    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+                    let mut mesh = egui::epaint::Mesh::with_texture(handle.id());
+                    mesh.add_rect_with_uv(lr.rect, uv, Color32::WHITE);
+                    painter.add(egui::Shape::Mesh(mesh));
                 }
             }
         }
@@ -657,8 +673,13 @@ impl TmuxRearrangeApp {
         // Draw drop zone highlight
         if let Some(ref drag) = self.drag {
             if let Some(ref zone) = drag.drop_zone {
-                let highlight_rect =
-                    compute_drop_highlight(zone, &drag.preview_tree, canvas_rect, &drag.pane_id);
+                let highlight_rect = compute_drop_highlight(
+                    zone,
+                    &self.pane_rects,
+                    &self.dividers,
+                    canvas_rect,
+                    &drag.pane_id,
+                );
                 if highlight_rect.is_positive() {
                     painter.rect_filled(
                         highlight_rect,
@@ -712,10 +733,12 @@ impl TmuxRearrangeApp {
     }
 }
 
-/// Compute the highlight rect for a drop zone.
+/// Compute the highlight rect for a drop zone using pre-computed natural
+/// layout rects and dividers.
 fn compute_drop_highlight(
     zone: &DropZone,
-    preview_tree: &Node,
+    pane_rects: &[LayoutRect],
+    dividers: &[layout::Divider],
     canvas_rect: Rect,
     _dragged_pane_id: &str,
 ) -> Rect {
@@ -746,9 +769,7 @@ fn compute_drop_highlight(
             left_pane,
             right_pane,
         } => {
-            let (_preview_rects, preview_dividers) =
-                compute_layout_rects(preview_tree, canvas_rect);
-            for div in &preview_dividers {
+            for div in dividers {
                 if (div.left_pane == *left_pane && div.right_pane == *right_pane)
                     || (div.left_pane == *right_pane && div.right_pane == *left_pane)
                 {
@@ -758,8 +779,7 @@ fn compute_drop_highlight(
             Rect::NOTHING
         }
         DropZone::Beside { pane_id, side } => {
-            let (preview_rects, _) = compute_layout_rects(preview_tree, canvas_rect);
-            if let Some(lr) = preview_rects.iter().find(|lr| &lr.pane_id == pane_id) {
+            if let Some(lr) = pane_rects.iter().find(|lr| &lr.pane_id == pane_id) {
                 let r = lr.rect;
                 let band_w = r.width() * BESIDE_BAND;
                 let band_h = r.height() * BESIDE_BAND;
@@ -782,14 +802,11 @@ fn compute_drop_highlight(
                 Rect::NOTHING
             }
         }
-        DropZone::Swap { pane_id } => {
-            let (preview_rects, _) = compute_layout_rects(preview_tree, canvas_rect);
-            preview_rects
-                .iter()
-                .find(|lr| &lr.pane_id == pane_id)
-                .map(|lr| lr.rect)
-                .unwrap_or(Rect::NOTHING)
-        }
+        DropZone::Swap { pane_id } => pane_rects
+            .iter()
+            .find(|lr| &lr.pane_id == pane_id)
+            .map(|lr| lr.rect)
+            .unwrap_or(Rect::NOTHING),
     }
 }
 
