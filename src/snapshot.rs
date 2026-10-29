@@ -1,63 +1,77 @@
-//! Pane snapshot capture and vt100 parsing into a cell grid for rendering.
+//! Pane snapshot capture and vt100 parsing into grayscale pixel buffers.
+//!
+//! Each terminal cell becomes one pixel in a minimap-style texture.
+//! No glyphs, fonts, or colour palettes — just three brightness levels.
 
 use vt100::Parser;
 
 // ---------------------------------------------------------------------------
-// Cell grid
+// Grayscale snapshot
 // ---------------------------------------------------------------------------
 
-/// A single terminal cell with foreground and background colors.
-#[derive(Debug, Clone)]
-pub struct Cell {
-    pub ch: char,
-    pub fg: egui::Color32,
-    pub bg: egui::Color32,
-}
-
-/// Parsed terminal screen grid.
-pub struct CellGrid {
-    cells: Vec<Vec<Option<Cell>>>,
-    rows: u16,
-    cols: u16,
-}
-
-impl CellGrid {
-    pub fn rows(&self) -> u16 {
-        self.rows
-    }
-
-    pub fn cols(&self) -> u16 {
-        self.cols
-    }
-
-    pub fn cell(&self, row: u16, col: u16) -> Option<&Cell> {
-        self.cells
-            .get(row as usize)
-            .and_then(|r| r.get(col as usize))
-            .and_then(|c| c.as_ref())
-    }
+/// A grayscale pixel buffer representing a pane's terminal content.
+///
+/// One byte per terminal cell, row-major: `pixels[y * cols + x]`.
+/// Length is always `cols * rows`.
+pub struct GrayscaleSnapshot {
+    pub pixels: Vec<u8>,
+    /// Width in cells (columns).
+    pub cols: u16,
+    /// Height in cells (rows).
+    pub rows: u16,
 }
 
 // ---------------------------------------------------------------------------
-// Parsing
+// Brightness levels
 // ---------------------------------------------------------------------------
 
-/// Parse raw vt100 output from `capture-pane -e` into a `CellGrid`.
-pub fn parse_snapshot(data: &[u8], rows: u16, cols: u16) -> CellGrid {
-    // vt100 parser needs screen dimensions; we use the pane dimensions
-    let rows = rows.max(1);
-    let cols = cols.max(1);
+/// Blank cells and default background.
+const DARK: u8 = 8;
+/// Light punctuation: `.` `,` `'` `-` etc.
+const LIGHT: u8 = 128;
+/// Most letters, digits, and symbols.
+const MEDIUM: u8 = 200;
+/// Heavy glyphs (`#` `M` `█`) and any cell with a non-default background.
+const HEAVY: u8 = 255;
+
+// ---------------------------------------------------------------------------
+// Build from vt100 capture
+// ---------------------------------------------------------------------------
+
+/// Parse raw vt100 output from `capture-pane -e` into a `GrayscaleSnapshot`.
+///
+/// `pane_rows` and `pane_cols` should be the pane's real `#{pane_height}` and
+/// `#{pane_width}` so the parser allocates the correct screen size and lines
+/// don't wrap or shift.
+pub fn build_grayscale_snapshot(data: &[u8], pane_rows: u16, pane_cols: u16) -> GrayscaleSnapshot {
+    let rows = pane_rows.max(1);
+    let cols = pane_cols.max(1);
 
     let mut parser = Parser::new(rows, cols, 0);
-    parser.process(data);
+
+    // tmux capture-pane -p outputs bare \n (LF without CR).  The vt100
+    // parser treats \n as line-feed-only, so each row continues at the
+    // previous column instead of resetting to 0.  Normalise bare \n → \r\n.
+    let normalized = normalize_newlines(data);
+    parser.process(&normalized);
 
     let screen = parser.screen();
-    let mut cells: Vec<Vec<Option<Cell>>> = vec![vec![None; cols as usize]; rows as usize];
+
+    // Use the screen's own size so the stride is always consistent with the
+    // cell grid, even if the caller passed something slightly different.
+    let (screen_rows, screen_cols) = screen.size();
+    let rows = screen_rows.max(1);
+    let cols = screen_cols.max(1);
+
+    let total = (rows as usize) * (cols as usize);
+    let mut pixels: Vec<u8> = vec![DARK; total];
 
     for row in 0..rows {
+        let row_base = (row as usize) * (cols as usize);
         for col in 0..cols {
-            if let Some(vt_cell) = screen.cell(row, col) {
-                // Only render cells that have content or non-default background
+            let idx = row_base + (col as usize);
+
+            let brightness = if let Some(vt_cell) = screen.cell(row, col) {
                 let contents = vt_cell.contents();
                 let ch = if contents.is_empty() {
                     ' '
@@ -65,212 +79,187 @@ pub fn parse_snapshot(data: &[u8], rows: u16, cols: u16) -> CellGrid {
                     contents.chars().next().unwrap_or(' ')
                 };
 
-                let fg = convert_fg_color(vt_cell.fgcolor());
-                let bg = convert_bg_color(vt_cell.bgcolor());
-
-                // Skip empty cells with default background for performance
-                if ch == ' ' && bg == DEFAULT_BG {
-                    continue;
+                if !is_default_color(vt_cell.bgcolor()) {
+                    // Non-default background → bright band (status bars, selections).
+                    HEAVY
+                } else if ch == ' ' {
+                    DARK
+                } else {
+                    char_brightness(ch)
                 }
+            } else {
+                DARK
+            };
 
-                cells[row as usize][col as usize] = Some(Cell { ch, fg, bg });
-            }
+            pixels[idx] = brightness;
         }
     }
 
-    CellGrid { cells, rows, cols }
+    GrayscaleSnapshot { pixels, cols, rows }
 }
 
 // ---------------------------------------------------------------------------
-// Color conversion
+// Line-ending normalization
 // ---------------------------------------------------------------------------
 
-const DEFAULT_FG: egui::Color32 = egui::Color32::from_rgb(192, 192, 192);
-const DEFAULT_BG: egui::Color32 = egui::Color32::from_rgb(0, 0, 0);
-
-fn convert_fg_color(c: vt100::Color) -> egui::Color32 {
-    match c {
-        vt100::Color::Default => DEFAULT_FG,
-        vt100::Color::Rgb(r, g, b) => egui::Color32::from_rgb(r, g, b),
-        vt100::Color::Idx(i) => ansi_color(i),
-    }
-}
-
-fn convert_bg_color(c: vt100::Color) -> egui::Color32 {
-    match c {
-        vt100::Color::Default => DEFAULT_BG,
-        vt100::Color::Rgb(r, g, b) => egui::Color32::from_rgb(r, g, b),
-        vt100::Color::Idx(i) => ansi_color(i),
-    }
-}
-
-/// Convert an ANSI 256-color index to egui::Color32.
-fn ansi_color(i: u8) -> egui::Color32 {
-    match i {
-        // Standard 16 ANSI colors
-        0 => egui::Color32::from_rgb(0, 0, 0),
-        1 => egui::Color32::from_rgb(205, 0, 0),
-        2 => egui::Color32::from_rgb(0, 205, 0),
-        3 => egui::Color32::from_rgb(205, 205, 0),
-        4 => egui::Color32::from_rgb(0, 0, 205),
-        5 => egui::Color32::from_rgb(205, 0, 205),
-        6 => egui::Color32::from_rgb(0, 205, 205),
-        7 => egui::Color32::from_rgb(229, 229, 229),
-        8 => egui::Color32::from_rgb(127, 127, 127),
-        9 => egui::Color32::from_rgb(255, 0, 0),
-        10 => egui::Color32::from_rgb(0, 255, 0),
-        11 => egui::Color32::from_rgb(255, 255, 0),
-        12 => egui::Color32::from_rgb(0, 0, 255),
-        13 => egui::Color32::from_rgb(255, 0, 255),
-        14 => egui::Color32::from_rgb(0, 255, 255),
-        15 => egui::Color32::from_rgb(255, 255, 255),
-        // 216 color cube (16..231)
-        16..=231 => {
-            let n = i - 16;
-            let r = cube_level((n / 36) % 6);
-            let g = cube_level((n / 6) % 6);
-            let b = cube_level(n % 6);
-            egui::Color32::from_rgb(r, g, b)
+/// Convert bare `\n` (LF) to `\r\n` (CRLF) so the vt100 parser resets the
+/// column on every newline.  Existing `\r\n` sequences are left unchanged.
+fn normalize_newlines(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + data.len() / 80);
+    for &b in data {
+        if b == b'\n' && out.last() != Some(&b'\r') {
+            out.push(b'\r');
         }
-        // Grayscale (232..255)
-        232..=255 => {
-            let level = (i - 232) * 10 + 8;
-            egui::Color32::from_rgb(level, level, level)
-        }
+        out.push(b);
     }
+    out
 }
 
-fn cube_level(idx: u8) -> u8 {
-    match idx {
-        0 => 0,
-        1 => 95,
-        2 => 135,
-        3 => 175,
-        4 => 215,
-        5 => 255,
-        _ => 0,
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn is_default_color(c: vt100::Color) -> bool {
+    matches!(c, vt100::Color::Default)
+}
+
+/// Three brightness levels by character weight.
+fn char_brightness(ch: char) -> u8 {
+    match ch {
+        // ---- light punctuation ----
+        '.' | ',' | '\'' | '`' | '´' | '-' | '_' | ':' | ';' => LIGHT,
+
+        // ---- heavy glyphs ----
+        '#' | 'M' | 'W' | 'm' | 'w' | '@' | '&' | '%' | '$' | '█' | '▓' | '▒' | '░' | '▇' | '▆'
+        | '▅' | '▄' | '▃' | '▂' | '▁' | 'B' | 'D' | 'E' | 'F' | 'G' | 'H' | 'K' | 'N' | 'Q'
+        | 'R' | 'X' | 'Z' => HEAVY,
+
+        // ---- everything else (letters, digits, symbols) ----
+        _ => MEDIUM,
     }
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot cache for rendering
+// Unit tests
 // ---------------------------------------------------------------------------
 
-/// Pre-computed snapshot ready for rendering.  Rebuilt only when pixel size changes.
-pub struct SnapshotCache {
-    /// Pre-computed shapes in local coordinates (origin at pane top-left).
-    cells: Vec<CachedCell>,
-    /// Pixel dimensions this cache was built for.
-    pixel_w: f32,
-    pixel_h: f32,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-struct CachedCell {
-    rect: egui::Rect,
-    bg: egui::Color32,
-    /// If present, a foreground block should be drawn at this relative rect
-    /// (inset from `rect`, only for non-space characters).
-    fg_rect: Option<egui::Rect>,
-    fg: egui::Color32,
-}
+    /// Build a small known screen (3 lines of different lengths) and assert
+    /// that bright pixels land at the expected (x, y) cells.
+    #[test]
+    fn test_bright_pixels_at_expected_positions() {
+        // Raw vt100: clear screen, then place text at known positions.
+        // Row 1, col 0: "abc"
+        // Row 2, col 4: "HELLO"
+        // Row 4, col 10: "x"
+        let data = b"\x1b[2J\x1b[H\x1b[2;1Habc\x1b[3;5HHELLO\x1b[5;11Hx";
 
-impl SnapshotCache {
-    pub fn new() -> Self {
-        SnapshotCache {
-            cells: Vec::new(),
-            pixel_w: 0.0,
-            pixel_h: 0.0,
+        let snap = build_grayscale_snapshot(data, 6, 20);
+
+        // Verify dimensions.
+        assert_eq!(snap.cols, 20, "cols");
+        assert_eq!(snap.rows, 6, "rows");
+        assert_eq!(snap.pixels.len(), 20 * 6);
+
+        // Helper: get pixel at (col, row) = (x, y).
+        let get = |x: u16, y: u16| -> u8 {
+            snap.pixels[(y as usize) * (snap.cols as usize) + (x as usize)]
+        };
+
+        // Row 1 (y=1): "abc" at cols 0,1,2 should be bright (MEDIUM for letters).
+        assert!(get(0, 1) >= MEDIUM, "a at (0,1)");
+        assert!(get(1, 1) >= MEDIUM, "b at (1,1)");
+        assert!(get(2, 1) >= MEDIUM, "c at (2,1)");
+        // Col 3 should be dark.
+        assert_eq!(get(3, 1), DARK);
+
+        // Row 2 (y=2): "HELLO" at cols 4..9 should be bright.
+        for x in 4..9 {
+            assert!(get(x, 2) >= MEDIUM, "HELLO char at ({},2)", x);
+        }
+        // Col 3 should be dark (gap before HELLO).
+        assert_eq!(get(3, 2), DARK);
+
+        // Row 4 (y=4): "x" at col 10 should be bright.
+        assert!(get(10, 4) >= MEDIUM, "x at (10,4)");
+        // Col 9 should be dark.
+        assert_eq!(get(9, 4), DARK);
+
+        // Row 0 should be all dark (blank line).
+        for x in 0..20 {
+            assert_eq!(get(x, 0), DARK, "blank row 0 col {}", x);
+        }
+
+        // Row 3 should be all dark.
+        for x in 0..20 {
+            assert_eq!(get(x, 3), DARK, "blank row 3 col {}", x);
+        }
+
+        // Row 5 should be all dark.
+        for x in 0..20 {
+            assert_eq!(get(x, 5), DARK, "blank row 5 col {}", x);
         }
     }
 
-    /// Rebuild the cache if the pixel size changed.  Returns true if rebuilt.
-    pub fn update(
-        &mut self,
-        grid: &CellGrid,
-        pixel_w: f32,
-        pixel_h: f32,
-        default_bg: egui::Color32,
-    ) -> bool {
-        let pixel_w = pixel_w.max(1.0);
-        let pixel_h = pixel_h.max(1.0);
-
-        if (self.pixel_w - pixel_w).abs() < 0.5 && (self.pixel_h - pixel_h).abs() < 0.5 {
-            return false; // no change
-        }
-
-        self.pixel_w = pixel_w;
-        self.pixel_h = pixel_h;
-
-        let rows = grid.rows();
-        let cols = grid.cols();
-        let cell_w = pixel_w / cols as f32;
-        let cell_h = pixel_h / rows as f32;
-
-        // Inset for the foreground block inside each cell.
-        let inset = cell_w.min(cell_h) * 0.15;
-
-        let mut cells = Vec::new();
-
-        for row in 0..rows {
-            for col in 0..cols {
-                let (bg, fg, has_char) = if let Some(cell) = grid.cell(row, col) {
-                    let ch = cell.ch;
-                    (cell.bg, cell.fg, ch != ' ' && ch != '\0')
-                } else {
-                    (default_bg, DEFAULT_FG, false)
-                };
-
-                let x = col as f32 * cell_w;
-                let y = row as f32 * cell_h;
-                let rect =
-                    egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x + cell_w, y + cell_h));
-
-                let fg_rect = if has_char {
-                    Some(egui::Rect::from_min_max(
-                        egui::pos2(x + inset, y + inset),
-                        egui::pos2(x + cell_w - inset, y + cell_h - inset),
-                    ))
-                } else {
-                    None
-                };
-
-                cells.push(CachedCell {
-                    rect,
-                    bg,
-                    fg_rect,
-                    fg,
-                });
-            }
-        }
-
-        self.cells = cells;
-        true
-    }
-
-    /// Render the snapshot into the given painter at `offset` position, clipped to `clip_rect`.
-    pub fn paint(&self, painter: &egui::Painter, offset: egui::Pos2, clip_rect: egui::Rect) {
-        for cell in &self.cells {
-            let rect = cell.rect.translate(offset.to_vec2());
-
-            // Quick reject: skip if outside clip rect
-            if !clip_rect.intersects(rect) {
-                continue;
-            }
-
-            // Background
-            painter.rect_filled(rect, 0.0, cell.bg);
-
-            // Foreground block (solid color, no text)
-            if let Some(fg_rect) = cell.fg_rect {
-                let fg_rect = fg_rect.translate(offset.to_vec2());
-                painter.rect_filled(fg_rect, 0.0, cell.fg);
-            }
+    /// A pane with only spaces should be all-dark.
+    #[test]
+    fn test_blank_pane_all_dark() {
+        let data = b"\x1b[2J\x1b[H"; // clear screen, cursor home
+        let snap = build_grayscale_snapshot(data, 5, 10);
+        assert_eq!(snap.pixels.len(), 50);
+        for &p in &snap.pixels {
+            assert_eq!(p, DARK);
         }
     }
-}
 
-impl Default for SnapshotCache {
-    fn default() -> Self {
-        Self::new()
+    /// Bare \n (as emitted by tmux capture-pane -p) must reset the column to
+    /// 0 so each row of text starts at x=0.
+    #[test]
+    fn test_bare_newline_resets_column() {
+        // "ab\ncdef\ng" should appear as:
+        //   row 0: "ab"   at cols 0,1
+        //   row 1: "cdef" at cols 0-3
+        //   row 2: "g"    at col 0
+        let data = b"ab\ncdef\ng";
+        let snap = build_grayscale_snapshot(data, 5, 10);
+
+        let get = |x: u16, y: u16| -> u8 {
+            snap.pixels[(y as usize) * (snap.cols as usize) + (x as usize)]
+        };
+
+        // Row 0: "ab" at cols 0,1; col 2 should be dark.
+        assert!(get(0, 0) >= MEDIUM, "a at (0,0)");
+        assert!(get(1, 0) >= MEDIUM, "b at (1,0)");
+        assert_eq!(get(2, 0), DARK, "dark at (2,0)");
+
+        // Row 1: "cdef" at cols 0-3; col 4 should be dark.
+        for x in 0..4 {
+            assert!(get(x, 1) >= MEDIUM, "cdef char at ({},1)", x);
+        }
+        assert_eq!(get(4, 1), DARK, "dark at (4,1)");
+
+        // Row 2: "g" at col 0; col 1 should be dark.
+        assert!(get(0, 2) >= MEDIUM, "g at (0,2)");
+        assert_eq!(get(1, 2), DARK, "dark at (1,2)");
+    }
+
+    /// Cells with non-default background (e.g. a coloured status bar) must be
+    /// bright regardless of the character content.
+    #[test]
+    fn test_non_default_background_is_bright() {
+        // Set background to red (ANSI 41) on row 0, then write a space.
+        // \x1b[41m = red background.
+        let data = b"\x1b[2J\x1b[H\x1b[41m \x1b[0m";
+        let snap = build_grayscale_snapshot(data, 3, 10);
+        let get = |x: u16, y: u16| -> u8 {
+            snap.pixels[(y as usize) * (snap.cols as usize) + (x as usize)]
+        };
+        // Cell (0,0) should be bright (red background), even though it's a space.
+        assert_eq!(get(0, 0), HEAVY);
+        // Cell (1,0) should be dark (default background, space).
+        assert_eq!(get(1, 0), DARK);
     }
 }

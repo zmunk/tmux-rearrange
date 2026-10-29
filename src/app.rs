@@ -1,7 +1,7 @@
 //! eframe App: drag-and-drop pane rearrangement UI.
 
 use crate::layout::{self, compute_layout_rects, leaf_order, LayoutRect, Node, Side};
-use crate::snapshot::{CellGrid, SnapshotCache};
+use crate::snapshot::GrayscaleSnapshot;
 use crate::tmux;
 use egui::{Color32, Pos2, Rect, Vec2};
 use std::collections::HashMap;
@@ -39,10 +39,12 @@ pub struct TmuxRearrangeApp {
     pane_info: HashMap<layout::PaneId, tmux::PaneInfo>,
     /// Active pane ID.
     active_pane_id: Option<layout::PaneId>,
-    /// Pane snapshots (cell grids) keyed by pane_id.
-    snapshots: HashMap<layout::PaneId, CellGrid>,
-    /// Snapshot render caches.
-    snapshot_caches: HashMap<layout::PaneId, SnapshotCache>,
+    /// Pane snapshots (grayscale pixel buffers) keyed by pane_id.
+    snapshots: HashMap<layout::PaneId, GrayscaleSnapshot>,
+    /// Uploaded egui textures, one per pane.
+    texture_handles: HashMap<layout::PaneId, egui::TextureHandle>,
+    /// Whether textures have been uploaded (done once on first frame).
+    textures_loaded: bool,
     /// The window target for tmux commands.
     window: String,
     /// Pane border status ("" or "top" or "bottom").
@@ -82,7 +84,7 @@ impl TmuxRearrangeApp {
         total_w: u16,
         total_h: u16,
         pane_info: Vec<tmux::PaneInfo>,
-        snapshots: HashMap<layout::PaneId, CellGrid>,
+        snapshots: HashMap<layout::PaneId, GrayscaleSnapshot>,
         active_pane_id: Option<layout::PaneId>,
         pane_border_status: String,
     ) -> Self {
@@ -98,7 +100,8 @@ impl TmuxRearrangeApp {
             pane_info: pane_info_map,
             active_pane_id,
             snapshots,
-            snapshot_caches: HashMap::new(),
+            texture_handles: HashMap::new(),
+            textures_loaded: false,
             window,
             pane_border_status,
             drag: None,
@@ -128,6 +131,12 @@ impl eframe::App for TmuxRearrangeApp {
                 }
             });
         });
+
+        // Lazy texture upload (once, on first frame)
+        if !self.textures_loaded {
+            self.upload_textures(ctx);
+            self.textures_loaded = true;
+        }
 
         // Central canvas
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -512,6 +521,39 @@ fn apply_drop(tree: &Node, zone: &DropZone, leaf: Node) -> Node {
 }
 
 // ---------------------------------------------------------------------------
+// Texture management
+// ---------------------------------------------------------------------------
+
+impl TmuxRearrangeApp {
+    /// Upload each pane's grayscale buffer as an egui texture (once at launch).
+    fn upload_textures(&mut self, ctx: &egui::Context) {
+        for (pane_id, snap) in &self.snapshots {
+            let pixels: Vec<egui::Color32> = snap
+                .pixels
+                .iter()
+                .map(|&v| egui::Color32::from_gray(v))
+                .collect();
+            // size is [width, height] = [cols, rows]; pixels.len() must equal cols * rows.
+            assert_eq!(pixels.len(), snap.cols as usize * snap.rows as usize);
+            let image = egui::ColorImage {
+                size: [snap.cols as usize, snap.rows as usize],
+                pixels,
+            };
+            let handle = ctx.load_texture(
+                format!("snap-{}", pane_id),
+                image,
+                egui::TextureOptions {
+                    magnification: egui::TextureFilter::Linear,
+                    minification: egui::TextureFilter::Linear,
+                    ..Default::default()
+                },
+            );
+            self.texture_handles.insert(pane_id.clone(), handle);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
@@ -555,40 +597,54 @@ impl TmuxRearrangeApp {
                 egui::Stroke::new(1.5_f32, border_color.gamma_multiply(alpha)),
             );
 
-            // Pane ID label
+            // Pane ID label (minimal, overlaid on minimap)
             let pane_id_str = &lr.pane_id;
-            let info = self.pane_info.get(pane_id_str);
-            let label = if let Some(info) = info {
-                format!("{} ({}x{})", pane_id_str, info.width, info.height)
-            } else {
-                pane_id_str.clone()
-            };
-
-            let font_id = egui::FontId::monospace(11.0);
-            let label_pos = lr.rect.left_top() + Vec2::new(4.0, 14.0);
+            let font_id = egui::FontId::monospace(10.0);
+            let label_pos = lr.rect.left_top() + Vec2::new(4.0, 12.0);
             painter.text(
                 label_pos,
                 egui::Align2::LEFT_TOP,
-                &label,
+                pane_id_str,
                 font_id,
-                Color32::WHITE.gamma_multiply(alpha),
+                Color32::from_rgba_premultiplied(255, 255, 255, 180),
             );
 
-            // Draw snapshot if available
-            if let Some(grid) = self.snapshots.get(&lr.pane_id) {
-                let cache = self
-                    .snapshot_caches
-                    .entry(lr.pane_id.clone())
-                    .or_insert_with(SnapshotCache::new);
+            // Draw grayscale minimap texture if available
+            if let Some(handle) = self.texture_handles.get(&lr.pane_id) {
+                if let Some(snap) = self.snapshots.get(&lr.pane_id) {
+                    let margin = 2.0;
+                    let label_h = 16.0;
+                    let avail = Rect::from_min_max(
+                        Pos2::new(lr.rect.left() + margin, lr.rect.top() + label_h),
+                        Pos2::new(lr.rect.right() - margin, lr.rect.bottom() - margin),
+                    );
 
-                let snap_rect = Rect::from_min_max(
-                    Pos2::new(lr.rect.left() + 2.0, lr.rect.top() + 22.0),
-                    Pos2::new(lr.rect.right() - 2.0, lr.rect.bottom() - 2.0),
-                );
+                    if avail.width() > 0.0 && avail.height() > 0.0 {
+                        // Terminal cells are ~2× taller than wide (cell aspect ≈ 0.5).
+                        // Letter-box the texture into `avail` preserving this aspect.
+                        let cell_aspect: f32 = 0.5;
+                        let tex_w = snap.cols as f32;
+                        let tex_h = snap.rows as f32;
+                        let tex_display_aspect = (tex_w * cell_aspect) / tex_h;
+                        let avail_aspect = avail.width() / avail.height();
 
-                if snap_rect.width() > 0.0 && snap_rect.height() > 0.0 {
-                    cache.update(grid, snap_rect.width(), snap_rect.height(), bg);
-                    cache.paint(painter, snap_rect.left_top(), snap_rect);
+                        let draw_rect = if avail_aspect > tex_display_aspect {
+                            // Height-constrained: centre horizontally.
+                            let h = avail.height();
+                            let w = h * tex_display_aspect;
+                            Rect::from_center_size(avail.center(), Vec2::new(w, h))
+                        } else {
+                            // Width-constrained: centre vertically.
+                            let w = avail.width();
+                            let h = w / tex_display_aspect;
+                            Rect::from_center_size(avail.center(), Vec2::new(w, h))
+                        };
+
+                        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+                        let mut mesh = egui::epaint::Mesh::with_texture(handle.id());
+                        mesh.add_rect_with_uv(draw_rect, uv, Color32::WHITE);
+                        painter.add(egui::Shape::Mesh(mesh));
+                    }
                 }
             }
         }

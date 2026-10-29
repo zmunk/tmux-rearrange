@@ -80,12 +80,12 @@ fn run(window: &str) -> Result<i32, Box<dyn std::error::Error>> {
     let tree = layout::parse_layout(&layout_str, &pane_ids)
         .map_err(|e| format!("failed to parse layout: {}", e))?;
 
-    // 6. Capture pane snapshots (sequentially for simplicity; could be parallel)
-    let mut snapshots: HashMap<String, snapshot::CellGrid> = HashMap::new();
+    // 6. Capture pane snapshots as grayscale minimaps
+    let mut snapshots: HashMap<String, snapshot::GrayscaleSnapshot> = HashMap::new();
     for info in &pane_info {
         match tmux::capture_pane(&info.pane_id) {
             Ok(data) => {
-                let grid = snapshot::parse_snapshot(&data, info.height, info.width);
+                let grid = snapshot::build_grayscale_snapshot(&data, info.height, info.width);
                 snapshots.insert(info.pane_id.clone(), grid);
             }
             Err(e) => {
